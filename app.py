@@ -33,16 +33,45 @@ def j(obj):
     st.code(json.dumps(obj, ensure_ascii=False, indent=2, default=_default), language="json")
 
 
-st.set_page_config(page_title="AMORE Template Agent (B+LangGraph)", layout="wide")
+st.set_page_config(page_title="AMORE Template Agent", layout="wide")
+
+
+# -------------------------
+# Target mappings
+# -------------------------
+GENDER_LABEL_TO_DB = {"여": "F", "남": "M"}
+SKIN_LABEL_TO_DB = {"건성": "dry", "지성": "oily", "복합성": "combination", "중성": "normal"}
+
+# ✅ 너가 말한 "키워드 → 카테고리" 매핑 (UI/기획 용어)
+CONCERN_KEYWORD_TO_CATEGORY = {
+    "민감성": "피부진정",
+    "트러블": "피부진정",
+    "탄력없음": "주름/탄력",
+    "주름": "주름/탄력",
+    "칙칙함": "미백/자외선차단",
+    "건조함": "영양/보습",
+    "모공": "블랙헤드/모공/피지",
+    "고민없음": "미백/자외선차단",
+}
+
+# ✅ "카테고리 → DB enum(user_features.skin_concern_primary)" 매핑
+# DB enum은 네 01_schema.sql 기준:
+# sensitivity, acne, pigmentation, wrinkles, pores, redness, hydration, barrier, unknown
+CATEGORY_TO_DB_CONCERNS = {
+    "피부진정": ["sensitivity", "redness", "barrier", "acne"],
+    "주름/탄력": ["wrinkles"],
+    "미백/자외선차단": ["pigmentation"],
+    "영양/보습": ["hydration", "barrier"],
+    "블랙헤드/모공/피지": ["pores"],
+}
+
+CONCERN_KEYWORDS_UI = list(CONCERN_KEYWORD_TO_CATEGORY.keys())
+CONCERN_CATEGORIES_UI = sorted(set(CONCERN_KEYWORD_TO_CATEGORY.values()))
 
 
 # -------------------------
 # Target helpers (DB preview)
 # -------------------------
-GENDER_LABEL_TO_DB = {"여": "F", "남": "M"}
-SKIN_LABEL_TO_DB = {"건성": "dry", "지성": "oily", "복합성": "combination", "중성": "normal"}
-
-
 def _has_column(db, table: str, column: str) -> bool:
     row = db.execute(text(f"SHOW COLUMNS FROM {table} LIKE :col"), {"col": column}).fetchone()
     return row is not None
@@ -70,19 +99,58 @@ def _age_band_to_birthyear_ranges(age_bands: list[str]) -> list[tuple[int, int]]
     return ranges
 
 
-def preview_target_users_local(db, target_input: dict, sample_size: int = 5) -> dict:
-    gender_vals = target_input.get("gender") or []
-    age_bands = target_input.get("age_bands") or []
-    skin_vals = target_input.get("skin_types") or []
+def resolve_concerns_from_keywords(keywords: list[str]) -> dict:
+    """
+    UI 키워드(민감성/트러블/...) -> 카테고리(피부진정/...) -> DB enum 리스트로 변환
+    """
+    keywords = [k for k in (keywords or []) if k in CONCERN_KEYWORD_TO_CATEGORY]
+    categories = []
+    for k in keywords:
+        categories.append(CONCERN_KEYWORD_TO_CATEGORY[k])
+    # unique preserve order
+    seen = set()
+    categories_uniq = []
+    for c in categories:
+        if c not in seen:
+            seen.add(c)
+            categories_uniq.append(c)
 
-    has_skin = _has_column(db, "user_features", "skin_type")
+    db_vals = []
+    for c in categories_uniq:
+        db_vals.extend(CATEGORY_TO_DB_CONCERNS.get(c, []))
+
+    # unique preserve order
+    seen2 = set()
+    db_vals_uniq = []
+    for v in db_vals:
+        if v not in seen2:
+            seen2.add(v)
+            db_vals_uniq.append(v)
+
+    return {
+        "concern_keywords": keywords,
+        "concern_categories": categories_uniq,
+        "skin_concerns": db_vals_uniq,  # DB enum values to filter
+    }
+
+
+def _build_where_and_params(db, target_resolved: dict):
+    gender_vals = target_resolved.get("gender") or []
+    age_bands = target_resolved.get("age_bands") or []
+    skin_vals = target_resolved.get("skin_types") or []
+    concern_vals = target_resolved.get("skin_concerns") or []
+
+    has_skin_type = _has_column(db, "user_features", "skin_type")
+    has_concern = _has_column(db, "user_features", "skin_concern_primary")
 
     where_clauses = []
     params = {}
+    bp = []
 
     if gender_vals:
         where_clauses.append("u.gender IN :genders")
-        params["genders"] = gender_vals  # tuple 말고 list로
+        params["genders"] = gender_vals
+        bp.append(bindparam("genders", expanding=True))
 
     ranges = _age_band_to_birthyear_ranges(age_bands)
     if ranges:
@@ -93,20 +161,25 @@ def preview_target_users_local(db, target_input: dict, sample_size: int = 5) -> 
             params[f"by_max_{i}"] = y_max
         where_clauses.append("(" + " OR ".join(ors) + ")")
 
-    if has_skin and skin_vals:
+    if has_skin_type and skin_vals:
         where_clauses.append("uf.skin_type IN :skin_types")
-        params["skin_types"] = skin_vals  # list로
+        params["skin_types"] = skin_vals
+        bp.append(bindparam("skin_types", expanding=True))
+
+    if has_concern and concern_vals:
+        where_clauses.append("uf.skin_concern_primary IN :skin_concerns")
+        params["skin_concerns"] = concern_vals
+        bp.append(bindparam("skin_concerns", expanding=True))
 
     where_sql = ""
     if where_clauses:
         where_sql = "WHERE " + " AND ".join(where_clauses)
 
-    # expanding bindparams 적용
-    bp = []
-    if "genders" in params:
-        bp.append(bindparam("genders", expanding=True))
-    if "skin_types" in params:
-        bp.append(bindparam("skin_types", expanding=True))
+    return where_sql, params, bp, has_skin_type, has_concern
+
+
+def preview_target_users_local(db, target_resolved: dict, sample_size: int = 5) -> dict:
+    where_sql, params, bp, has_skin_type, has_concern = _build_where_and_params(db, target_resolved)
 
     q_count = text(f"""
         SELECT COUNT(*) AS cnt
@@ -117,24 +190,21 @@ def preview_target_users_local(db, target_input: dict, sample_size: int = 5) -> 
 
     cnt = db.execute(q_count, params).scalar() or 0
 
-    if has_skin:
-        q_sample = text(f"""
-            SELECT u.user_id, u.gender, u.birth_year, uf.skin_type
-            FROM users u
-            LEFT JOIN user_features uf ON uf.user_id = u.user_id
-            {where_sql}
-            ORDER BY u.user_id
-            LIMIT :limit_n
-        """).bindparams(*bp)
-    else:
-        q_sample = text(f"""
-            SELECT u.user_id, u.gender, u.birth_year
-            FROM users u
-            LEFT JOIN user_features uf ON uf.user_id = u.user_id
-            {where_sql}
-            ORDER BY u.user_id
-            LIMIT :limit_n
-        """).bindparams(*bp)
+    # sample columns
+    cols = ["u.user_id", "u.gender", "u.birth_year"]
+    if has_skin_type:
+        cols.append("uf.skin_type")
+    if has_concern:
+        cols.append("uf.skin_concern_primary")
+
+    q_sample = text(f"""
+        SELECT {", ".join(cols)}
+        FROM users u
+        LEFT JOIN user_features uf ON uf.user_id = u.user_id
+        {where_sql}
+        ORDER BY u.user_id
+        LIMIT :limit_n
+    """).bindparams(*bp)
 
     params2 = dict(params)
     params2["limit_n"] = int(sample_size)
@@ -145,12 +215,60 @@ def preview_target_users_local(db, target_input: dict, sample_size: int = 5) -> 
     for r in rows:
         by = r.get("birth_year")
         age = (cur - int(by)) if by else None
-        item = {"user_id": r.get("user_id"), "gender": r.get("gender"), "birth_year": by, "age": age}
-        if has_skin:
+        item = {
+            "user_id": r.get("user_id"),
+            "gender": r.get("gender"),
+            "birth_year": by,
+            "age": age,
+        }
+        if has_skin_type:
             item["skin_type"] = r.get("skin_type")
+        if has_concern:
+            item["skin_concern_primary"] = r.get("skin_concern_primary")
         sample.append(item)
 
-    return {"count": int(cnt), "sample": sample, "has_skin_type": has_skin}
+    return {
+        "count": int(cnt),
+        "sample": sample,
+        "has_skin_type": has_skin_type,
+        "has_skin_concern_primary": has_concern,
+    }
+
+
+def fetch_target_user_ids(db, target_resolved: dict, limit_n: int = 500) -> dict:
+    """
+    뒤쪽 agent로 넘길 "대상 user_id 리스트" 생성 (너무 커지지 않게 limit)
+    """
+    where_sql, params, bp, _, _ = _build_where_and_params(db, target_resolved)
+
+    q = text(f"""
+        SELECT u.user_id
+        FROM users u
+        LEFT JOIN user_features uf ON uf.user_id = u.user_id
+        {where_sql}
+        ORDER BY u.user_id
+        LIMIT :limit_n
+    """).bindparams(*bp)
+
+    params2 = dict(params)
+    params2["limit_n"] = int(limit_n)
+    rows = db.execute(q, params2).mappings().all()
+    user_ids = [r["user_id"] for r in rows]
+
+    # total count도 같이 (limit과 별개로)
+    q_count = text(f"""
+        SELECT COUNT(*) AS cnt
+        FROM users u
+        LEFT JOIN user_features uf ON uf.user_id = u.user_id
+        {where_sql}
+    """).bindparams(*bp)
+    total = db.execute(q_count, params).scalar() or 0
+
+    return {
+        "total_count": int(total),
+        "limit": int(limit_n),
+        "user_ids": user_ids,
+    }
 
 
 def main():
@@ -188,7 +306,6 @@ def main():
 
             created_by = st.text_input("created_by(=user_id)", value="marketer_001")
 
-            # goal(캠페인 목표) = 3개 시나리오 토글(라디오)
             scenario_labels = [
                 "1) 화장품 특징 기반 추천 CRM(자연어 입력 필요)",
                 "2) 장바구니 미구매 상품 CRM",
@@ -200,22 +317,15 @@ def main():
                 scenario_labels[2]: "reorder_top",
             }
 
-            goal_label = st.radio(
-                "goal(캠페인 목표)",
-                scenario_labels,
-                index=0,
-                horizontal=True,
-            )
+            goal_label = st.radio("goal(캠페인 목표)", scenario_labels, index=0, horizontal=True)
             campaign_goal_code = scenario_codes[goal_label]
 
             col1, col2 = st.columns(2)
             with col1:
                 channel_hint = st.selectbox("채널 힌트(선택)", ["PUSH", "SMS", "KAKAO", "EMAIL"], index=0)
             with col2:
-                # tone_hint를 브랜드 선택으로
                 tone_hint = st.selectbox("브랜드 톤(선택)", ["amoremall", "innisfree"], index=0)
 
-            # 1번 시나리오만 campaign_text 입력 허용
             disable_campaign_text = (goal_label != scenario_labels[0])
             campaign_text_value = "" if disable_campaign_text else "겨울철 보습 루틴을 강조하면서, 기존 구매 고객의 재구매를 유도하는 캠페인. 톤은 친근하게."
 
@@ -228,20 +338,19 @@ def main():
             )
 
             brief = {
-                "goal": goal_label,                  # UI 라벨
-                "campaign_goal": campaign_goal_code, # 내부 코드
-                "campaign_text": campaign_text,      # 1번에서만 값 존재
+                "goal": goal_label,
+                "campaign_goal": campaign_goal_code,
+                "campaign_text": campaign_text,
                 "channel_hint": channel_hint,
-                "tone_hint": tone_hint,              # 브랜드 id
+                "tone_hint": tone_hint,
             }
 
             if st.button("run 생성"):
                 rid = repo.create_run(created_by, brief, channel=channel_hint)
 
-                # BRIEF handoff 저장
                 repo.create_handoff(rid, "BRIEF", brief)
-
                 repo.update_run(rid, step_id="S1_BRIEF")
+
                 st.session_state["run_id"] = rid
                 st.success(f"run_id = {rid}")
 
@@ -270,51 +379,110 @@ def main():
 
             brief = run.get("brief_json", {}) or {}
             channel = run.get("channel") or brief.get("channel_hint") or "PUSH"
-
-            # tone은 브랜드 id
             tone = (brief.get("tone_hint") or "amoremall").strip().lower()
 
             st.markdown("### 현재 채널/톤(=Step1 힌트)")
             st.write({"channel": channel, "tone": tone})
 
             st.markdown("### 타겟 선택(키워드 멀티선택)")
+            st.caption("ℹ️ 아무 것도 선택하지 않으면 '전체(필터 없음)'로 동작합니다.")
 
-            # UI 옵션(라벨)
             gender_labels = ["여", "남"]
             age_band_labels = ["10대", "20대", "30대", "40대", "50대+"]
             skin_labels = ["건성", "지성", "복합성", "중성"]
 
-            sel_genders_label = st.multiselect("성별", gender_labels, default=gender_labels)
-            sel_age_bands = st.multiselect("나이대", age_band_labels, default=["20대"])
-            sel_skin_label = st.multiselect("피부타입", skin_labels, default=[])
+            # ✅ 기본값을 빈 리스트로: 선택 안 하면 전체
+            sel_genders_label = st.multiselect("성별 (미선택=전체)", gender_labels, default=[])
+            sel_age_bands = st.multiselect("나이대 (미선택=전체)", age_band_labels, default=[])
+            sel_skin_label = st.multiselect("피부타입 (미선택=전체)", skin_labels, default=[])
 
-            # DB 값으로 변환
+            # ✅ 피부고민(키워드) 추가
+            sel_concern_keywords = st.multiselect(
+                "피부고민(키워드) (미선택=전체)",
+                CONCERN_KEYWORDS_UI,
+                default=[],
+                help="키워드는 내부적으로 카테고리로 매핑된 뒤, DB skin_concern_primary(enum) 조건으로 변환됩니다.",
+            )
+
             sel_genders_db = [GENDER_LABEL_TO_DB[x] for x in sel_genders_label if x in GENDER_LABEL_TO_DB]
             sel_skin_db = [SKIN_LABEL_TO_DB[x] for x in sel_skin_label if x in SKIN_LABEL_TO_DB]
 
             target_input = {
-                "gender": sel_genders_db,     # F/M
-                "age_bands": sel_age_bands,   # 밴드 라벨 유지
-                "skin_types": sel_skin_db,    # 컬럼 없으면 preview에서 자동 무시
+                "gender": sel_genders_db,            # F/M
+                "age_bands": sel_age_bands,          # 라벨 유지
+                "skin_types": sel_skin_db,           # dry/oily/...
+                "concern_keywords": sel_concern_keywords,  # 민감성/트러블/...
             }
 
-            preview = preview_target_users_local(repo.db, target_input, sample_size=5)
+            # ✅ 키워드 → 카테고리/DB값으로 resolve
+            resolved = resolve_concerns_from_keywords(sel_concern_keywords)
+            target_resolved = {
+                **target_input,
+                **resolved,  # concern_keywords / concern_categories / skin_concerns
+            }
+
+            preview = preview_target_users_local(repo.db, target_resolved, sample_size=5)
 
             st.markdown("### 타겟 미리보기")
             st.write(f"대상 수: **{preview['count']}명**")
+
             if not preview.get("has_skin_type"):
                 st.info("user_features.skin_type 컬럼이 없어 피부타입 필터/표시는 현재 무시됩니다. (추가하면 자동 활성화)")
+            if not preview.get("has_skin_concern_primary"):
+                st.info("user_features.skin_concern_primary 컬럼이 없어 피부고민 필터/표시는 현재 무시됩니다. (추가하면 자동 활성화)")
 
+            # UI에서 선택한 값 + resolve 결과 같이 보여주기
+            st.markdown("#### TARGET_INPUT (UI 선택값)")
+            j(target_input)
+
+            st.markdown("#### TARGET_RESOLVED (키워드→카테고리→DB필터 변환 결과)")
+            j({
+                "concern_keywords": target_resolved.get("concern_keywords", []),
+                "concern_categories": target_resolved.get("concern_categories", []),
+                "skin_concerns(DB enum)": target_resolved.get("skin_concerns", []),
+            })
+
+            st.markdown("#### 샘플 유저(최대 5)")
             j(preview)
 
             if st.button("LangGraph 실행(후보 생성까지)"):
+                # ✅ 뒤쪽 agent에서 재사용 가능하도록 3종 handoff 저장
                 repo.create_handoff(run_id, "TARGET_INPUT", target_input)
+                repo.create_handoff(run_id, "TARGET_RESOLVED", target_resolved)
+
+                users_pack = fetch_target_user_ids(repo.db, target_resolved, limit_n=500)
+                # 샘플도 같이 넣어주면 Step3/Execution에서 디버깅 쉬움
+                users_pack["sample"] = preview.get("sample", [])
+                repo.create_handoff(run_id, "TARGET_USERS", users_pack)
+
                 repo.update_run(run_id, step_id="S2_READY")
 
                 run_until_candidates(run_id, channel=channel, tone=tone)
                 st.success("완료: TARGET/RAG/후보/컴플라이언스 생성됨 (템플릿 후보 단계까지)")
 
-            st.markdown("### TARGET")
+            # ---- handoff view ----
+            st.markdown("### TARGET_INPUT")
+            h = repo.get_latest_handoff(run_id, "TARGET_INPUT")
+            if h:
+                j(h["payload_json"])
+            else:
+                st.info("TARGET_INPUT handoff가 아직 없습니다. (Step2 실행 필요)")
+
+            st.markdown("### TARGET_RESOLVED")
+            h = repo.get_latest_handoff(run_id, "TARGET_RESOLVED")
+            if h:
+                j(h["payload_json"])
+            else:
+                st.info("TARGET_RESOLVED handoff가 아직 없습니다. (Step2 실행 필요)")
+
+            st.markdown("### TARGET_USERS (count + user_ids 일부)")
+            h = repo.get_latest_handoff(run_id, "TARGET_USERS")
+            if h:
+                j(h["payload_json"])
+            else:
+                st.info("TARGET_USERS handoff가 아직 없습니다. (Step2 실행 필요)")
+
+            st.markdown("### TARGET (workflow가 생성한 값)")
             h = repo.get_latest_handoff(run_id, "TARGET")
             if h:
                 j(h["payload_json"])
@@ -351,7 +519,6 @@ def main():
                 st.warning("좌측 run_id 입력 후 진행하세요.")
                 return
 
-            # 후보/컴플라이언스 로드
             h_cands = repo.get_latest_handoff(run_id, "TEMPLATE_CANDIDATES")
             h_comp = repo.get_latest_handoff(run_id, "COMPLIANCE")
             h_sel = repo.get_latest_handoff(run_id, "SELECTED_TEMPLATE")
@@ -385,7 +552,6 @@ def main():
                 title = c.get("title") or ""
                 labels.append(f"[{status}] {tid}  {title}")
 
-            # 기본 선택값(기존 선택이 있으면 그거로)
             default_idx = 0
             if selected_id:
                 for i, c in enumerate(candidates):
@@ -409,7 +575,6 @@ def main():
             with colA:
                 if st.button("✅ 이 후보로 확정(SELECTED_TEMPLATE 저장)"):
                     repo.create_handoff(run_id, "SELECTED_TEMPLATE", picked)
-                    # campaign_runs에 status/step_id/candidate_id가 있는 경우 업데이트(없으면 무시되도록 repo가 설계되어 있진 않지만, 현재 repo 기준 컬럼 있음)
                     try:
                         repo.update_run(run_id, step_id="S3_SELECTED", candidate_id=(tid or "")[:16], status="SELECTED")
                     except Exception:
@@ -479,7 +644,6 @@ def main():
                 st.info("handoff가 없습니다.")
                 return
 
-            # 가볍게 stage/time만 표로
             import pandas as pd
             df = pd.DataFrame([{
                 "created_at": r.get("created_at"),
@@ -491,6 +655,7 @@ def main():
 
             st.markdown("### 상세 payload(최근 1개)")
             j(rows[-1].get("payload_json"))
+
 
 if __name__ == "__main__":
     main()
