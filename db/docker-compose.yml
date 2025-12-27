@@ -13,11 +13,21 @@ services:
       - "${MYSQL_PORT}:3306"
     volumes:
       - crm_mysql_data:/var/lib/mysql
-      - ./init:/docker-entrypoint-initdb.d
+      - ./init/00_init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+      - ./init/01_seed.sql:/docker-entrypoint-initdb.d/01_seed.sql:ro
+
+      # ✅ jobs는 "보관만" (자동 실행 X)
+      - ./init/02_jobs.sql:/opt/sql/02_jobs.sql:ro
+
     command: >
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_0900_ai_ci
       --default-time-zone=+09:00
 
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 volumes:
-  crm_mysql_data:
+   crm_mysql_data:

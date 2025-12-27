@@ -1,7 +1,10 @@
+# app.py
 import sys
 from pathlib import Path
 import json
+import re
 import streamlit as st
+import streamlit.components.v1 as components
 
 from datetime import datetime, date
 from decimal import Decimal
@@ -18,6 +21,47 @@ from crm_agent.db.repo import Repo
 from crm_agent.flow.workflow import run_until_candidates  # 후보 생성까지만 사용
 
 
+# =========================
+# v2 UI embed helpers
+# =========================
+UI_ROOT = ROOT / "ui" / "v2"
+
+def render_v2(page: str, height: int = 900):
+    """
+    v2.zip의 정적 HTML/CSS를 Streamlit에 임베드(데모용).
+    - css 상대경로는 인라인로 주입
+    - html 내부 페이지 이동 링크는 막고, 페이지 전환은 streamlit이 담당
+    """
+    html_path = UI_ROOT / f"{page}.html"
+    css_path = UI_ROOT / "css" / f"{page}.css"
+
+    if not html_path.exists():
+        st.warning(f"UI 파일이 없습니다: {html_path}")
+        return
+    if not css_path.exists():
+        st.warning(f"CSS 파일이 없습니다: {css_path}")
+        return
+
+    html_text = html_path.read_text(encoding="utf-8")
+    css_text = css_path.read_text(encoding="utf-8")
+
+    # link 태그 제거(상대경로 css는 streamlit iframe에서 안 먹는 경우가 많음)
+    html_text = re.sub(r'<link[^>]+href="\./css/[^"]+"[^>]*>\s*', '', html_text)
+    # a href 페이지 이동 막기(페이지 전환은 streamlit이 담당)
+    html_text = re.sub(r'href="\./(index|first|second|third)\.html"', 'href="#"', html_text)
+
+    # CSS 인라인 주입
+    if "</head>" in html_text:
+        html_text = html_text.replace("</head>", f"<style>{css_text}</style></head>")
+    else:
+        html_text = f"<style>{css_text}</style>\n{html_text}"
+
+    components.html(html_text, height=height, scrolling=True)
+
+
+# =========================
+# JSON pretty helper
+# =========================
 def j(obj):
     """
     Streamlit JSON 출력용 helper
@@ -55,8 +99,7 @@ CONCERN_KEYWORD_TO_CATEGORY = {
 }
 
 # ✅ "카테고리 → DB enum(user_features.skin_concern_primary)" 매핑
-# DB enum은 네 01_schema.sql 기준:
-# sensitivity, acne, pigmentation, wrinkles, pores, redness, hydration, barrier, unknown
+# DB enum: sensitivity, acne, pigmentation, wrinkles, pores, redness, hydration, barrier, unknown
 CATEGORY_TO_DB_CONCERNS = {
     "피부진정": ["sensitivity", "redness", "barrier", "acne"],
     "주름/탄력": ["wrinkles"],
@@ -107,6 +150,7 @@ def resolve_concerns_from_keywords(keywords: list[str]) -> dict:
     categories = []
     for k in keywords:
         categories.append(CONCERN_KEYWORD_TO_CATEGORY[k])
+
     # unique preserve order
     seen = set()
     categories_uniq = []
@@ -190,7 +234,6 @@ def preview_target_users_local(db, target_resolved: dict, sample_size: int = 5) 
 
     cnt = db.execute(q_count, params).scalar() or 0
 
-    # sample columns
     cols = ["u.user_id", "u.gender", "u.birth_year"]
     if has_skin_type:
         cols.append("uf.skin_type")
@@ -255,7 +298,6 @@ def fetch_target_user_ids(db, target_resolved: dict, limit_n: int = 500) -> dict
     rows = db.execute(q, params2).mappings().all()
     user_ids = [r["user_id"] for r in rows]
 
-    # total count도 같이 (limit과 별개로)
     q_count = text(f"""
         SELECT COUNT(*) AS cnt
         FROM users u
@@ -283,6 +325,7 @@ def main():
     page = st.sidebar.radio(
         "페이지",
         [
+            "Home(UI Preview)",
             "Step1 브리프(캠페인 입력)",
             "Step2 후보 생성(톤/타겟)",
             "Step3 후보/선택(템플릿 확정)",
@@ -299,292 +342,326 @@ def main():
         repo = Repo(db)
 
         # -------------------------
+        # Home: UI only preview
+        # -------------------------
+        if page == "Home(UI Preview)":
+            st.subheader("UI 미리보기(프론트 v2)")
+            colL, colR = st.columns([1.3, 1.0], gap="large")
+            with colL:
+                render_v2("index", height=950)
+            with colR:
+                st.info(
+                    "이 화면은 **프론트팀 정적 UI(HTML/CSS)** 를 Streamlit에 임베드한 것입니다.\n\n"
+                    "- 실제 입력/실행은 좌측 메뉴의 Step1~Step4에서 진행됩니다.\n"
+                    "- 데모 단계에서는 UI를 '보여주기용'으로 사용합니다."
+                )
+                st.write("현재 run_id:", st.session_state.get("run_id", ""))
+
+        # -------------------------
         # Step1
         # -------------------------
-        if page == "Step1 브리프(캠페인 입력)":
-            st.subheader("Step1) 캠페인 브리프 입력 → run 생성")
+        elif page == "Step1 브리프(캠페인 입력)":
+            colL, colR = st.columns([1.3, 1.0], gap="large")
+            with colL:
+                render_v2("first", height=950)
 
-            created_by = st.text_input("created_by(=user_id)", value="marketer_001")
+            with colR:
+                st.subheader("Step1) 캠페인 브리프 입력 → run 생성")
 
-            scenario_labels = [
-                "1) 화장품 특징 기반 추천 CRM(자연어 입력 필요)",
-                "2) 장바구니 미구매 상품 CRM",
-                "3) 재구매율 높은 상품 CRM",
-            ]
-            scenario_codes = {
-                scenario_labels[0]: "feature_reco",
-                scenario_labels[1]: "cart_abandon",
-                scenario_labels[2]: "reorder_top",
-            }
+                created_by = st.text_input("created_by(=user_id)", value="marketer_001")
 
-            goal_label = st.radio("goal(캠페인 목표)", scenario_labels, index=0, horizontal=True)
-            campaign_goal_code = scenario_codes[goal_label]
+                scenario_labels = [
+                    "1) 화장품 특징 기반 추천 CRM(자연어 입력 필요)",
+                    "2) 장바구니 미구매 상품 CRM",
+                    "3) 재구매율 높은 상품 CRM",
+                ]
+                scenario_codes = {
+                    scenario_labels[0]: "feature_reco",
+                    scenario_labels[1]: "cart_abandon",
+                    scenario_labels[2]: "reorder_top",
+                }
 
-            col1, col2 = st.columns(2)
-            with col1:
-                channel_hint = st.selectbox("채널 힌트(선택)", ["PUSH", "SMS", "KAKAO", "EMAIL"], index=0)
-            with col2:
-                tone_hint = st.selectbox("브랜드 톤(선택)", ["amoremall", "innisfree"], index=0)
+                goal_label = st.radio("goal(캠페인 목표)", scenario_labels, index=0, horizontal=True)
+                campaign_goal_code = scenario_codes[goal_label]
 
-            disable_campaign_text = (goal_label != scenario_labels[0])
-            campaign_text_value = "" if disable_campaign_text else "겨울철 보습 루틴을 강조하면서, 기존 구매 고객의 재구매를 유도하는 캠페인. 톤은 친근하게."
+                col1, col2 = st.columns(2)
+                with col1:
+                    channel_hint = st.selectbox("채널 힌트(선택)", ["PUSH", "SMS", "KAKAO", "EMAIL"], index=0)
+                with col2:
+                    tone_hint = st.selectbox("브랜드 톤(선택)", ["amoremall", "innisfree"], index=0)
 
-            campaign_text = st.text_area(
-                "campaign_text(자연어 캠페인 설명)",
-                value=campaign_text_value,
-                height=120,
-                disabled=disable_campaign_text,
-                placeholder="(1번 시나리오에서만 입력 가능)",
-            )
+                disable_campaign_text = (goal_label != scenario_labels[0])
+                campaign_text_value = "" if disable_campaign_text else (
+                    "겨울철 보습 루틴을 강조하면서, 기존 구매 고객의 재구매를 유도하는 캠페인. 톤은 친근하게."
+                )
 
-            brief = {
-                "goal": goal_label,
-                "campaign_goal": campaign_goal_code,
-                "campaign_text": campaign_text,
-                "channel_hint": channel_hint,
-                "tone_hint": tone_hint,
-            }
+                campaign_text = st.text_area(
+                    "campaign_text(자연어 캠페인 설명)",
+                    value=campaign_text_value,
+                    height=120,
+                    disabled=disable_campaign_text,
+                    placeholder="(1번 시나리오에서만 입력 가능)",
+                )
 
-            if st.button("run 생성"):
-                rid = repo.create_run(created_by, brief, channel=channel_hint)
+                brief = {
+                    "goal": goal_label,
+                    "campaign_goal": campaign_goal_code,
+                    "campaign_text": campaign_text,
+                    "channel_hint": channel_hint,
+                    "tone_hint": tone_hint,
+                }
 
-                repo.create_handoff(rid, "BRIEF", brief)
-                repo.update_run(rid, step_id="S1_BRIEF")
+                if st.button("run 생성"):
+                    rid = repo.create_run(created_by, brief, channel=channel_hint)
+                    repo.create_handoff(rid, "BRIEF", brief)
+                    repo.update_run(rid, step_id="S1_BRIEF")
 
-                st.session_state["run_id"] = rid
-                st.success(f"run_id = {rid}")
+                    st.session_state["run_id"] = rid
+                    st.success(f"run_id = {rid}")
 
-            if st.session_state.get("run_id"):
-                run = repo.get_run(st.session_state["run_id"])
-                if run:
-                    st.markdown("### 현재 Run")
-                    st.write(f"status: {run.get('status')} / step_id: {run.get('step_id')} / channel: {run.get('channel')}")
-                    j(run.get("brief_json", {}))
+                if st.session_state.get("run_id"):
+                    run = repo.get_run(st.session_state["run_id"])
+                    if run:
+                        st.markdown("### 현재 Run")
+                        st.write(
+                            f"status: {run.get('status')} / step_id: {run.get('step_id')} / channel: {run.get('channel')}"
+                        )
+                        j(run.get("brief_json", {}))
 
         # -------------------------
         # Step2
         # -------------------------
         elif page == "Step2 후보 생성(톤/타겟)":
-            st.subheader("Step2) 톤/타겟 선택 → LangGraph 실행(템플릿 후보 생성까지)")
-            st.caption("✅ Step2에서 channel/tone 선택 UI는 제거했습니다. Step1 힌트를 사용합니다.")
+            colL, colR = st.columns([1.3, 1.0], gap="large")
+            with colL:
+                render_v2("second", height=950)
 
-            if not run_id:
-                st.warning("좌측 run_id 입력 또는 Step1에서 생성하세요.")
-                return
+            with colR:
+                st.subheader("Step2) 톤/타겟 선택 → LangGraph 실행(템플릿 후보 생성까지)")
+                st.caption("✅ Step2에서 channel/tone 선택 UI는 제거했습니다. Step1 힌트를 사용합니다.")
 
-            run = repo.get_run(run_id)
-            if not run:
-                st.error("run_id가 유효하지 않습니다.")
-                return
+                if not run_id:
+                    st.warning("좌측 run_id 입력 또는 Step1에서 생성하세요.")
+                    return
 
-            brief = run.get("brief_json", {}) or {}
-            channel = run.get("channel") or brief.get("channel_hint") or "PUSH"
-            tone = (brief.get("tone_hint") or "amoremall").strip().lower()
+                run = repo.get_run(run_id)
+                if not run:
+                    st.error("run_id가 유효하지 않습니다.")
+                    return
 
-            st.markdown("### 현재 채널/톤(=Step1 힌트)")
-            st.write({"channel": channel, "tone": tone})
+                brief = run.get("brief_json", {}) or {}
+                channel = run.get("channel") or brief.get("channel_hint") or "PUSH"
+                tone = (brief.get("tone_hint") or "amoremall").strip().lower()
 
-            st.markdown("### 타겟 선택(키워드 멀티선택)")
-            st.caption("ℹ️ 아무 것도 선택하지 않으면 '전체(필터 없음)'로 동작합니다.")
+                st.markdown("### 현재 채널/톤(=Step1 힌트)")
+                st.write({"channel": channel, "tone": tone})
 
-            gender_labels = ["여", "남"]
-            age_band_labels = ["10대", "20대", "30대", "40대", "50대+"]
-            skin_labels = ["건성", "지성", "복합성", "중성"]
+                st.markdown("### 타겟 선택(키워드 멀티선택)")
+                st.caption("ℹ️ 아무 것도 선택하지 않으면 '전체(필터 없음)'로 동작합니다.")
 
-            # ✅ 기본값을 빈 리스트로: 선택 안 하면 전체
-            sel_genders_label = st.multiselect("성별 (미선택=전체)", gender_labels, default=[])
-            sel_age_bands = st.multiselect("나이대 (미선택=전체)", age_band_labels, default=[])
-            sel_skin_label = st.multiselect("피부타입 (미선택=전체)", skin_labels, default=[])
+                gender_labels = ["여", "남"]
+                age_band_labels = ["10대", "20대", "30대", "40대", "50대+"]
+                skin_labels = ["건성", "지성", "복합성", "중성"]
 
-            # ✅ 피부고민(키워드) 추가
-            sel_concern_keywords = st.multiselect(
-                "피부고민(키워드) (미선택=전체)",
-                CONCERN_KEYWORDS_UI,
-                default=[],
-                help="키워드는 내부적으로 카테고리로 매핑된 뒤, DB skin_concern_primary(enum) 조건으로 변환됩니다.",
-            )
+                sel_genders_label = st.multiselect("성별 (미선택=전체)", gender_labels, default=[])
+                sel_age_bands = st.multiselect("나이대 (미선택=전체)", age_band_labels, default=[])
+                sel_skin_label = st.multiselect("피부타입 (미선택=전체)", skin_labels, default=[])
 
-            sel_genders_db = [GENDER_LABEL_TO_DB[x] for x in sel_genders_label if x in GENDER_LABEL_TO_DB]
-            sel_skin_db = [SKIN_LABEL_TO_DB[x] for x in sel_skin_label if x in SKIN_LABEL_TO_DB]
+                sel_concern_keywords = st.multiselect(
+                    "피부고민(키워드) (미선택=전체)",
+                    CONCERN_KEYWORDS_UI,
+                    default=[],
+                    help="키워드는 내부적으로 카테고리로 매핑된 뒤, DB skin_concern_primary(enum) 조건으로 변환됩니다.",
+                )
 
-            target_input = {
-                "gender": sel_genders_db,            # F/M
-                "age_bands": sel_age_bands,          # 라벨 유지
-                "skin_types": sel_skin_db,           # dry/oily/...
-                "concern_keywords": sel_concern_keywords,  # 민감성/트러블/...
-            }
+                sel_genders_db = [GENDER_LABEL_TO_DB[x] for x in sel_genders_label if x in GENDER_LABEL_TO_DB]
+                sel_skin_db = [SKIN_LABEL_TO_DB[x] for x in sel_skin_label if x in SKIN_LABEL_TO_DB]
 
-            # ✅ 키워드 → 카테고리/DB값으로 resolve
-            resolved = resolve_concerns_from_keywords(sel_concern_keywords)
-            target_resolved = {
-                **target_input,
-                **resolved,  # concern_keywords / concern_categories / skin_concerns
-            }
+                target_input = {
+                    "gender": sel_genders_db,                 # F/M
+                    "age_bands": sel_age_bands,               # 라벨 유지
+                    "skin_types": sel_skin_db,                # dry/oily/...
+                    "concern_keywords": sel_concern_keywords, # 민감성/트러블/...
+                }
 
-            preview = preview_target_users_local(repo.db, target_resolved, sample_size=5)
+                resolved = resolve_concerns_from_keywords(sel_concern_keywords)
+                target_resolved = {**target_input, **resolved}
 
-            st.markdown("### 타겟 미리보기")
-            st.write(f"대상 수: **{preview['count']}명**")
+                preview = preview_target_users_local(repo.db, target_resolved, sample_size=5)
 
-            if not preview.get("has_skin_type"):
-                st.info("user_features.skin_type 컬럼이 없어 피부타입 필터/표시는 현재 무시됩니다. (추가하면 자동 활성화)")
-            if not preview.get("has_skin_concern_primary"):
-                st.info("user_features.skin_concern_primary 컬럼이 없어 피부고민 필터/표시는 현재 무시됩니다. (추가하면 자동 활성화)")
+                st.markdown("### 타겟 미리보기")
+                st.write(f"대상 수: **{preview['count']}명**")
 
-            # UI에서 선택한 값 + resolve 결과 같이 보여주기
-            st.markdown("#### TARGET_INPUT (UI 선택값)")
-            j(target_input)
+                if not preview.get("has_skin_type"):
+                    st.info("user_features.skin_type 컬럼이 없어 피부타입 필터/표시는 현재 무시됩니다. (추가하면 자동 활성화)")
+                if not preview.get("has_skin_concern_primary"):
+                    st.info("user_features.skin_concern_primary 컬럼이 없어 피부고민 필터/표시는 현재 무시됩니다. (추가하면 자동 활성화)")
 
-            st.markdown("#### TARGET_RESOLVED (키워드→카테고리→DB필터 변환 결과)")
-            j({
-                "concern_keywords": target_resolved.get("concern_keywords", []),
-                "concern_categories": target_resolved.get("concern_categories", []),
-                "skin_concerns(DB enum)": target_resolved.get("skin_concerns", []),
-            })
+                st.markdown("#### TARGET_INPUT (UI 선택값)")
+                j(target_input)
 
-            st.markdown("#### 샘플 유저(최대 5)")
-            j(preview)
+                st.markdown("#### TARGET_RESOLVED (키워드→카테고리→DB필터 변환 결과)")
+                j({
+                    "concern_keywords": target_resolved.get("concern_keywords", []),
+                    "concern_categories": target_resolved.get("concern_categories", []),
+                    "skin_concerns(DB enum)": target_resolved.get("skin_concerns", []),
+                })
 
-            if st.button("LangGraph 실행(후보 생성까지)"):
-                # ✅ 뒤쪽 agent에서 재사용 가능하도록 3종 handoff 저장
-                repo.create_handoff(run_id, "TARGET_INPUT", target_input)
-                repo.create_handoff(run_id, "TARGET_RESOLVED", target_resolved)
+                st.markdown("#### 샘플 유저(최대 5)")
+                j(preview)
 
-                users_pack = fetch_target_user_ids(repo.db, target_resolved, limit_n=500)
-                # 샘플도 같이 넣어주면 Step3/Execution에서 디버깅 쉬움
-                users_pack["sample"] = preview.get("sample", [])
-                repo.create_handoff(run_id, "TARGET_USERS", users_pack)
+                # ✅ 핵심 수정: workflow가 기대하는 TARGET_AUDIENCE로 저장
+                if st.button("LangGraph 실행(후보 생성까지)"):
+                    repo.create_handoff(run_id, "TARGET_INPUT", target_input)
 
-                repo.update_run(run_id, step_id="S2_READY")
+                    users_pack = fetch_target_user_ids(repo.db, target_resolved, limit_n=500)
+                    target_audience = {
+                        "count": int(users_pack["total_count"]),   # 전체 타겟 수(리밋과 무관)
+                        "user_ids": users_pack["user_ids"],        # downstream 용
+                        "sample": preview.get("sample", []),
+                        "resolved": {
+                            "concern_keywords": target_resolved.get("concern_keywords", []),
+                            "concern_categories": target_resolved.get("concern_categories", []),
+                            "skin_concerns": target_resolved.get("skin_concerns", []),
+                        },
+                    }
+                    repo.create_handoff(run_id, "TARGET_AUDIENCE", target_audience)
 
-                run_until_candidates(run_id, channel=channel, tone=tone)
-                st.success("완료: TARGET/RAG/후보/컴플라이언스 생성됨 (템플릿 후보 단계까지)")
+                    repo.update_run(run_id, step_id="S2_READY")
+                    run_until_candidates(run_id, channel=channel, tone=tone)
 
-            # ---- handoff view ----
-            st.markdown("### TARGET_INPUT")
-            h = repo.get_latest_handoff(run_id, "TARGET_INPUT")
-            if h:
-                j(h["payload_json"])
-            else:
-                st.info("TARGET_INPUT handoff가 아직 없습니다. (Step2 실행 필요)")
+                    st.success("완료: TARGET/RAG/후보/컴플라이언스 생성됨 (템플릿 후보 단계까지)")
 
-            st.markdown("### TARGET_RESOLVED")
-            h = repo.get_latest_handoff(run_id, "TARGET_RESOLVED")
-            if h:
-                j(h["payload_json"])
-            else:
-                st.info("TARGET_RESOLVED handoff가 아직 없습니다. (Step2 실행 필요)")
+                # ---- handoff view ----
+                st.markdown("### TARGET_INPUT")
+                h = repo.get_latest_handoff(run_id, "TARGET_INPUT")
+                if h:
+                    j(h["payload_json"])
+                else:
+                    st.info("TARGET_INPUT handoff가 아직 없습니다. (Step2 실행 필요)")
 
-            st.markdown("### TARGET_USERS (count + user_ids 일부)")
-            h = repo.get_latest_handoff(run_id, "TARGET_USERS")
-            if h:
-                j(h["payload_json"])
-            else:
-                st.info("TARGET_USERS handoff가 아직 없습니다. (Step2 실행 필요)")
+                st.markdown("### TARGET_AUDIENCE")
+                h = repo.get_latest_handoff(run_id, "TARGET_AUDIENCE")
+                if h:
+                    j(h["payload_json"])
+                else:
+                    st.info("TARGET_AUDIENCE handoff가 아직 없습니다. (Step2 실행 필요)")
 
-            st.markdown("### TARGET (workflow가 생성한 값)")
-            h = repo.get_latest_handoff(run_id, "TARGET")
-            if h:
-                j(h["payload_json"])
-            else:
-                st.info("TARGET handoff가 아직 없습니다. (Step2 실행 필요)")
+                st.markdown("### TARGET (workflow가 생성한 값)")
+                h = repo.get_latest_handoff(run_id, "TARGET")
+                if h:
+                    j(h["payload_json"])
+                else:
+                    st.info("TARGET handoff가 아직 없습니다. (Step2 실행 필요)")
 
-            st.markdown("### RAG")
-            h = repo.get_latest_handoff(run_id, "RAG")
-            if h:
-                j(h["payload_json"])
-            else:
-                st.info("RAG handoff가 아직 없습니다.")
+                st.markdown("### RAG")
+                h = repo.get_latest_handoff(run_id, "RAG")
+                if h:
+                    j(h["payload_json"])
+                else:
+                    st.info("RAG handoff가 아직 없습니다.")
 
-            st.markdown("### TEMPLATE_CANDIDATES (슬롯 템플릿 후보)")
-            h = repo.get_latest_handoff(run_id, "TEMPLATE_CANDIDATES")
-            if h:
-                j(h["payload_json"])
-            else:
-                st.info("후보가 아직 없습니다. Step2 실행 필요")
+                st.markdown("### TEMPLATE_CANDIDATES (슬롯 템플릿 후보)")
+                h = repo.get_latest_handoff(run_id, "TEMPLATE_CANDIDATES")
+                if h:
+                    j(h["payload_json"])
+                else:
+                    st.info("후보가 아직 없습니다. Step2 실행 필요")
 
-            st.markdown("### COMPLIANCE (후보별 PASS/WARN/FAIL)")
-            h = repo.get_latest_handoff(run_id, "COMPLIANCE")
-            if h:
-                j(h["payload_json"])
-            else:
-                st.info("컴플라이언스 결과가 아직 없습니다.")
+                st.markdown("### COMPLIANCE (후보별 PASS/WARN/FAIL)")
+                h = repo.get_latest_handoff(run_id, "COMPLIANCE")
+                if h:
+                    j(h["payload_json"])
+                else:
+                    st.info("컴플라이언스 결과가 아직 없습니다.")
 
         # -------------------------
         # Step3
         # -------------------------
         elif page == "Step3 후보/선택(템플릿 확정)":
-            st.subheader("Step3) 후보 확인 → 템플릿 선택(확정)")
-            if not run_id:
-                st.warning("좌측 run_id 입력 후 진행하세요.")
-                return
+            colL, colR = st.columns([1.3, 1.0], gap="large")
+            with colL:
+                render_v2("third", height=950)
 
-            h_cands = repo.get_latest_handoff(run_id, "TEMPLATE_CANDIDATES")
-            h_comp = repo.get_latest_handoff(run_id, "COMPLIANCE")
-            h_sel = repo.get_latest_handoff(run_id, "SELECTED_TEMPLATE")
+            with colR:
+                st.subheader("Step3) 후보 확인 → 템플릿 선택(확정)")
+                if not run_id:
+                    st.warning("좌측 run_id 입력 후 진행하세요.")
+                    return
 
-            if not h_cands:
-                st.warning("TEMPLATE_CANDIDATES가 없습니다. Step2에서 'LangGraph 실행(후보 생성까지)'를 먼저 실행하세요.")
-                return
+                h_cands = repo.get_latest_handoff(run_id, "TEMPLATE_CANDIDATES")
+                h_comp = repo.get_latest_handoff(run_id, "COMPLIANCE")
+                h_sel = repo.get_latest_handoff(run_id, "SELECTED_TEMPLATE")
 
-            cands_payload = h_cands["payload_json"] or {}
-            candidates = cands_payload.get("candidates", []) or []
+                if not h_cands:
+                    st.warning("TEMPLATE_CANDIDATES가 없습니다. Step2에서 'LangGraph 실행(후보 생성까지)'를 먼저 실행하세요.")
+                    return
 
-            if not candidates:
-                st.warning("후보 리스트가 비어 있습니다. Step2 실행 로그를 확인하세요.")
-                j(cands_payload)
-                return
+                cands_payload = h_cands["payload_json"] or {}
+                candidates = cands_payload.get("candidates", []) or []
 
-            comp_map = {}
-            if h_comp:
-                comp_payload = h_comp["payload_json"] or {}
-                for r in (comp_payload.get("results") or []):
-                    comp_map[r.get("template_id")] = r
+                if not candidates:
+                    st.warning("후보 리스트가 비어 있습니다. Step2 실행 로그를 확인하세요.")
+                    j(cands_payload)
+                    return
 
-            selected_id = None
-            if h_sel:
-                selected_id = (h_sel["payload_json"] or {}).get("template_id")
+                comp_map = {}
+                if h_comp:
+                    comp_payload = h_comp["payload_json"] or {}
+                    for r in (comp_payload.get("results") or []):
+                        comp_map[r.get("template_id")] = r
 
-            labels = []
-            for i, c in enumerate(candidates):
-                tid = c.get("template_id")
-                status = (comp_map.get(tid) or {}).get("status", "N/A")
-                title = c.get("title") or ""
-                labels.append(f"[{status}] {tid}  {title}")
-
-            default_idx = 0
-            if selected_id:
-                for i, c in enumerate(candidates):
-                    if c.get("template_id") == selected_id:
-                        default_idx = i
-                        break
-
-            idx = st.radio("후보 선택", list(range(len(labels))), format_func=lambda i: labels[i], index=default_idx)
-
-            picked = candidates[idx]
-            tid = picked.get("template_id")
-            st.markdown("### 선택 후보 미리보기")
-            j({
-                "template_id": tid,
-                "title": picked.get("title"),
-                "body_with_slots": picked.get("body_with_slots"),
-                "compliance": comp_map.get(tid, {}),
-            })
-
-            colA, colB = st.columns(2)
-            with colA:
-                if st.button("✅ 이 후보로 확정(SELECTED_TEMPLATE 저장)"):
-                    repo.create_handoff(run_id, "SELECTED_TEMPLATE", picked)
-                    try:
-                        repo.update_run(run_id, step_id="S3_SELECTED", candidate_id=(tid or "")[:16], status="SELECTED")
-                    except Exception:
-                        pass
-                    st.success("SELECTED_TEMPLATE 저장 완료. Step4에서 승인 진행하세요.")
-
-            with colB:
+                selected_id = None
                 if h_sel:
-                    st.info("현재 DB에 저장된 SELECTED_TEMPLATE가 있습니다.")
-                    j(h_sel["payload_json"])
+                    selected_id = (h_sel["payload_json"] or {}).get("template_id")
+
+                labels = []
+                for c in candidates:
+                    tid = c.get("template_id")
+                    status = (comp_map.get(tid) or {}).get("status", "N/A")
+                    title = c.get("title") or ""
+                    labels.append((tid, f"[{status}] {tid}  {title}"))
+
+                # default selection
+                default_idx = 0
+                if selected_id:
+                    for i, (tid, _) in enumerate(labels):
+                        if tid == selected_id:
+                            default_idx = i
+                            break
+
+                idx = st.radio(
+                    "후보 선택",
+                    list(range(len(labels))),
+                    format_func=lambda i: labels[i][1],
+                    index=default_idx,
+                )
+
+                picked = candidates[idx]
+                tid = picked.get("template_id")
+
+                st.markdown("### 선택 후보 미리보기")
+                j({
+                    "template_id": tid,
+                    "title": picked.get("title"),
+                    "body_with_slots": picked.get("body_with_slots"),
+                    "compliance": comp_map.get(tid, {}),
+                })
+
+                colA, colB = st.columns(2)
+                with colA:
+                    if st.button("✅ 이 후보로 확정(SELECTED_TEMPLATE 저장)"):
+                        repo.create_handoff(run_id, "SELECTED_TEMPLATE", picked)
+                        try:
+                            repo.update_run(run_id, step_id="S3_SELECTED", candidate_id=(tid or "")[:16], status="SELECTED")
+                        except Exception:
+                            pass
+                        st.success("SELECTED_TEMPLATE 저장 완료. Step4에서 승인 진행하세요.")
+
+                with colB:
+                    if h_sel:
+                        st.info("현재 DB에 저장된 SELECTED_TEMPLATE가 있습니다.")
+                        j(h_sel["payload_json"])
 
         # -------------------------
         # Step4

@@ -129,6 +129,125 @@ def _summarize_target_input(target_input: dict) -> str:
 
     return " / ".join(parts) if parts else "NO_FILTERS(전체 대상)"
 
+    # =========================
+# Candidate Post-Processor
+# =========================
+
+DETAIL_SLOT = "product_detail"
+
+def _normalize_slot_schema(c: dict) -> None:
+    """
+    slot_schema를 안전하게 보정하고, product_detail 슬롯을 optional로 추가
+    """
+    ss = c.get("slot_schema") or {}
+    required = list(ss.get("required") or [])
+    optional = list(ss.get("optional") or [])
+
+    # 중복 제거
+    req_set = []
+    for x in required:
+        if x and x not in req_set:
+            req_set.append(x)
+
+    opt_set = []
+    for x in optional:
+        if x and x not in opt_set:
+            opt_set.append(x)
+
+    # ✅ Execution Agent가 채울 상세설명 슬롯 추가 (optional)
+    if DETAIL_SLOT not in opt_set:
+        opt_set.append(DETAIL_SLOT)
+
+    c["slot_schema"] = {
+        "required": req_set,
+        "optional": opt_set,
+    }
+
+
+def _normalize_body_with_slots(c: dict, channel: str) -> None:
+    """
+    body_with_slots 정리 규칙
+    - {customer_name} 단독 줄 제거
+    - '고객님,' -> '{customer_name}님,'로 정규화
+    - product_detail 슬롯이 없으면 2번째 줄에 삽입
+    """
+    body = (c.get("body_with_slots") or "").strip()
+    if not body:
+        return
+
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return
+
+    # 1) {customer_name} 단독 줄 제거
+    lines = [ln for ln in lines if ln != "{customer_name}"]
+
+    # 2) 첫 줄 인사 정규화
+    # - "고객님," 같이 generic이면 customer_name을 앞으로 끌어오기
+    first = lines[0]
+    if "고객님" in first and "{customer_name}" not in first:
+        # "고객님," -> "{customer_name}님,"
+        first = first.replace("고객님,", "{customer_name}님,")
+        first = first.replace("고객님", "{customer_name}님")  # 콤마 없는 케이스 대비
+        lines[0] = first
+
+    # 3) product_detail 슬롯 삽입(없으면)
+    joined = "\n".join(lines)
+    if "{product_detail}" not in joined:
+        # 채널별 표현(데모용 기본값)
+        # - PUSH/KAKAO: 한 줄 불릿 추천
+        # - SMS: 짧은 문장
+        if (channel or "").upper() in ("SMS",):
+            detail_line = "{product_detail}"
+        else:
+            detail_line = "· {product_detail}"
+
+        insert_idx = 1 if len(lines) >= 1 else 0
+        lines.insert(insert_idx, detail_line)
+
+    c["body_with_slots"] = "\n".join(lines).strip()
+
+
+def _normalize_default_slot_values(c: dict, channel: str) -> None:
+    """
+    default_slot_values 정리
+    - PUSH/SMS/KAKAO에서는 subject 제거(EMAIL 전용)
+    - cta 기본값이 {deep_link}이면 위험 -> 안전한 기본 문구로 변경
+    """
+    dv = c.get("default_slot_values") or {}
+
+    # 1) subject는 EMAIL에서만 유지
+    if (channel or "").upper() != "EMAIL":
+        dv.pop("subject", None)
+
+    # 2) cta 기본값 안전화
+    # 기존에 cta="{deep_link}"면 deep_link 미채움 시 cta가 날아가버림
+    cta = (dv.get("cta") or "").strip()
+    if (not cta) or (cta == "{deep_link}"):
+        dv["cta"] = "지금 확인하기"  # execution agent가 deep_link 포함 문구로 덮어써도 됨
+
+    c["default_slot_values"] = dv
+
+
+def postprocess_candidates_payload(payload: dict, channel: str) -> dict:
+    """
+    TEMPLATE_CANDIDATES payload를 일괄 보정:
+    - slot_schema 보정(+product_detail optional 추가)
+    - body_with_slots 정리
+    - default_slot_values 정리
+    """
+    payload = payload or {}
+    cands = payload.get("candidates") or []
+
+    for c in cands:
+        _normalize_slot_schema(c)
+        _normalize_body_with_slots(c, channel=channel)
+        _normalize_default_slot_values(c, channel=channel)
+
+    payload["candidates"] = cands
+    return payload
+
+
 
 def node_load_brief(state: CRMState) -> CRMState:
     repo = _repo()
@@ -298,12 +417,16 @@ def node_candidates(state: CRMState) -> CRMState:
                 target=target,
                 k=5,  # 후보 5개 유지
             )
+            
+        candidates = postprocess_candidates_payload(candidates, channel=channel)
 
         repo.create_handoff(run_id, ST_TEMPLATE_CANDIDATES, candidates)
         repo.update_run(run_id, step_id="S4_CANDS")
         return {**state, "candidates": candidates}
+    
     finally:
         _close_repo(repo)
+       
 
 
 def node_compliance(state: CRMState) -> CRMState:
